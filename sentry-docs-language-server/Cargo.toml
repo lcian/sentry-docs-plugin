@@ -4,3 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+sentry = "0.36.0"
+sentry-tracing = "0.36.0"
+tokio = { version = "1.44.1", features = ["full"] }
+tower-lsp-server = { git = "https://github.com/tower-lsp-community/tower-lsp-server.git", branch = "main" }
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
