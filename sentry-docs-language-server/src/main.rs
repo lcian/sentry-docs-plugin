@@ -1,8 +1,9 @@
-use dashmap::DashMap;
+use roxmltree::Document;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex;
 
+use html_parser::Dom;
 use sentry::protocol::Url;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::lsp_types::*;
@@ -10,24 +11,21 @@ use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 use tracing_subscriber::prelude::*;
 
 #[derive(Debug)]
-struct DocumentContents {
-    inner: Vec<u8>,
-}
-
-impl DocumentContents {
-    fn find() {}
-}
-
-impl From<Vec<u8>> for DocumentContents {
-    fn from(inner: Vec<u8>) -> Self {
-        Self { inner }
-    }
-}
-
-#[derive(Debug)]
 struct Backend {
     client: Client,
-    documents: RwLock<HashMap<Uri, DocumentContents>>,
+    documents: parking_lot::RwLock<HashMap<Uri, Vec<Vec<u8>>>>,
+}
+
+impl Backend {
+    #[tracing::instrument]
+    async fn update_document(&self, uri: Uri, text: String) {
+        self.documents.write().insert(
+            uri,
+            text.lines()
+                .map(|line| line.to_owned().into_bytes())
+                .collect(),
+        );
+    }
 }
 
 #[tower_lsp_server::async_trait]
@@ -51,7 +49,11 @@ impl LanguageServer for Backend {
 
         let server_info = Some(ServerInfo {
             name: "sentry-docs-language-server".to_owned(),
-            version: Some("1.0".to_owned()),
+            version: Some(
+                sentry::release_name!()
+                    .unwrap_or("0.1.0".into())
+                    .to_string(),
+            ),
         });
         let capabilities = ServerCapabilities {
             position_encoding: Some(PositionEncodingKind::UTF8),
@@ -76,10 +78,7 @@ impl LanguageServer for Backend {
     #[tracing::instrument]
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let document = params.text_document;
-        self.documents
-            .write()
-            .expect("poison")
-            .insert(document.uri, document.text.into_bytes().into());
+        self.update_document(document.uri, document.text).await;
     }
 
     #[tracing::instrument]
@@ -87,10 +86,7 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         let change = params.content_changes.into_iter().next();
         if change.is_some() {
-            self.documents
-                .write()
-                .expect("poison")
-                .insert(uri, change.unwrap().text.into_bytes().into());
+            self.update_document(uri, change.unwrap().text).await;
         }
     }
 
@@ -101,15 +97,26 @@ impl LanguageServer for Backend {
     ) -> Result<Option<GotoDefinitionResponse>> {
         let params = params.text_document_position_params;
         let uri = params.text_document.uri;
-        let lock = self.documents.read().expect("poison");
-        let contents = lock.get(&uri);
-        if contents.is_none() {
+        let enclosing_tag = {
+            let map = self.documents.read();
+            let contents = map.get(&uri);
+            if contents.is_none() {
+                return Ok(None);
+            }
+            let contents = contents.unwrap();
+            let i = params.position.line as usize;
+            let j = params.position.character as usize;
+            find_enclosing_tag(contents, i, j)
+        };
+        if enclosing_tag.is_ok() {
             return Ok(None);
         }
-        let contents = contents.unwrap();
-        let i = params.position.line as usize;
-        let j = params.position.character as usize;
-        drop(lock);
+        let enclosing_tag = enclosing_tag.unwrap();
+        let parsed = Document::parse(enclosing_tag.as_str()).expect("failed to parse tag");
+        let tag_name = parsed.root_element().tag_name();
+        self.client
+            .log_message(MessageType::INFO, format!("{}", tag_name.name()))
+            .await;
         Ok(None)
     }
 
@@ -118,13 +125,79 @@ impl LanguageServer for Backend {
     }
 }
 
+fn find_enclosing_tag(
+    contents: &Vec<Vec<u8>>,
+    i: usize,
+    j: usize,
+) -> std::result::Result<String, ()> {
+    let langle_pos = {
+        let mut ii = i as i32;
+        let mut jj = j;
+        let mut k = -1_i32;
+        while ii >= 0 {
+            let line = &contents[ii as usize];
+            if ii as usize != i {
+                jj = line.len() - 1;
+            }
+            if let Some(kk) = line.iter().take(jj + 1).rposition(|c| *c == '<' as u8) {
+                k = kk as i32;
+                break;
+            }
+            ii -= 1;
+        }
+        if k != -1 {
+            Some((ii as usize, k as usize))
+        } else {
+            None
+        }
+    };
+    let rangle_pos = {
+        let mut ii = i;
+        let mut jj = j;
+        let mut k = -1_i32;
+        while ii < contents.len() as usize {
+            let line = &contents[ii];
+            if ii as usize != i {
+                jj = 0;
+            }
+            if let Some(kk) = line.iter().take(jj + 1).position(|c| *c == '>' as u8) {
+                k = kk as i32;
+                break;
+            }
+            ii += 1;
+        }
+        if k != -1 {
+            Some((ii, k as usize))
+        } else {
+            None
+        }
+    };
+    if !(langle_pos.is_some() && rangle_pos.is_some()) {
+        return Err(());
+    }
+
+    let (start_i, start_j) = langle_pos.unwrap();
+    let (end_i, end_j) = rangle_pos.unwrap();
+
+    Ok(contents[start_i..end_i]
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let j = if i == start_i { start_j } else { 0 };
+            let jj = if i == end_i { end_j } else { line.len() - 1 };
+            String::from_utf8_lossy(&contents[i][j..jj]).into_owned()
+        })
+        .collect::<Vec<String>>()
+        .join(" "))
+}
+
 #[tokio::main]
 async fn main() {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
     let (service, socket) = LspService::new(|client| Backend {
         client,
-        documents: Arc::new(Mutex::new(HashMap::new())),
+        documents: parking_lot::RwLock::new(HashMap::new()),
     });
     Server::new(stdin, stdout, socket).serve(service).await;
 }
