@@ -1,10 +1,6 @@
 use roxmltree::Document;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
-use tokio::sync::Mutex;
 
-use html_parser::Dom;
-use sentry::protocol::Url;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::lsp_types::*;
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
@@ -64,7 +60,6 @@ impl LanguageServer for Backend {
         Ok(InitializeResult {
             server_info,
             capabilities,
-            ..Default::default()
         })
     }
 
@@ -115,7 +110,7 @@ impl LanguageServer for Backend {
         let parsed = Document::parse(enclosing_tag.as_str()).expect("failed to parse tag");
         let tag_name = parsed.root_element().tag_name();
         self.client
-            .log_message(MessageType::INFO, format!("{}", tag_name.name()))
+            .log_message(MessageType::INFO, tag_name.name().to_string())
             .await;
         Ok(None)
     }
@@ -125,11 +120,7 @@ impl LanguageServer for Backend {
     }
 }
 
-fn find_enclosing_tag(
-    contents: &Vec<Vec<u8>>,
-    i: usize,
-    j: usize,
-) -> std::result::Result<String, ()> {
+fn find_enclosing_tag(contents: &[Vec<u8>], i: usize, j: usize) -> std::result::Result<String, ()> {
     let langle_pos = {
         let mut ii = i as i32;
         let mut jj = j;
@@ -139,7 +130,7 @@ fn find_enclosing_tag(
             if ii as usize != i {
                 jj = line.len() - 1;
             }
-            if let Some(kk) = line.iter().take(jj + 1).rposition(|c| *c == '<' as u8) {
+            if let Some(kk) = line.iter().take(jj + 1).rposition(|c| *c == b'<') {
                 k = kk as i32;
                 break;
             }
@@ -155,12 +146,12 @@ fn find_enclosing_tag(
         let mut ii = i;
         let mut jj = j;
         let mut k = -1_i32;
-        while ii < contents.len() as usize {
+        while ii < contents.len() {
             let line = &contents[ii];
-            if ii as usize != i {
+            if ii != i {
                 jj = 0;
             }
-            if let Some(kk) = line.iter().take(jj + 1).position(|c| *c == '>' as u8) {
+            if let Some(kk) = line.iter().take(jj + 1).position(|c| *c == b'>') {
                 k = kk as i32;
                 break;
             }
