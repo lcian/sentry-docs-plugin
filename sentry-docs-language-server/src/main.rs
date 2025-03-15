@@ -1,5 +1,7 @@
-use roxmltree::Document;
+use roxmltree::{Document, Node};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::lsp_types::*;
@@ -24,25 +26,39 @@ impl Backend {
     }
 }
 
+#[derive(Debug, Clone)]
+enum Tag {
+    Include(PathBuf),
+    Other,
+}
+
+impl<'a, 'b> From<Node<'a, 'b>> for Tag {
+    fn from(node: Node<'_, '_>) -> Self {
+        match node.tag_name().name() {
+            "Include" => Self::Include(node.attribute("name").unwrap().into()),
+            _ => Self::Other,
+        }
+    }
+}
+
+#[tracing::instrument]
+fn get_target_path(root: &PathBuf, tag: &Tag) -> PathBuf {
+    match tag {
+        Tag::Include(path) => {
+            if path.is_absolute() {
+                path.clone()
+            } else {
+                root.join("includes/").join(path)
+            }
+        }
+        _ => unimplemented!(),
+    }
+}
+
 #[tower_lsp_server::async_trait]
 impl LanguageServer for Backend {
     #[tracing::instrument]
     async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
-        let guard = sentry::init((
-            "https://6b76fb2a5dc1164849cd797b75b6d879@o447951.ingest.us.sentry.io/4508694563782656",
-            sentry::ClientOptions {
-                traces_sample_rate: 1.0,
-                release: sentry::release_name!(),
-                debug: true,
-                ..sentry::ClientOptions::default()
-            },
-        ));
-        Box::leak(Box::new(guard));
-        tracing_subscriber::registry()
-            .with(tracing_subscriber::fmt::layer())
-            .with(sentry_tracing::layer())
-            .init();
-
         let server_info = Some(ServerInfo {
             name: "sentry-docs-language-server".to_owned(),
             version: Some(
@@ -73,6 +89,12 @@ impl LanguageServer for Backend {
     #[tracing::instrument]
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let document = params.text_document;
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!("did_open {}", document.uri.as_str()),
+            )
+            .await;
         self.update_document(document.uri, document.text).await;
     }
 
@@ -103,16 +125,51 @@ impl LanguageServer for Backend {
             let j = params.position.character as usize;
             find_enclosing_tag(contents, i, j)
         };
-        if enclosing_tag.is_ok() {
+        if !enclosing_tag.is_ok() {
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    "goto_definition called with no enclosing tag",
+                )
+                .await;
             return Ok(None);
         }
         let enclosing_tag = enclosing_tag.unwrap();
         let parsed = Document::parse(enclosing_tag.as_str()).expect("failed to parse tag");
         let tag_name = parsed.root_element().tag_name();
         self.client
-            .log_message(MessageType::INFO, tag_name.name().to_string())
+            .log_message(
+                MessageType::INFO,
+                format!("goto_definition called within {}", tag_name.name()),
+            )
             .await;
-        Ok(None)
+        let docs_root_path = get_docs_root_path(&uri);
+        self.client
+            .log_message(MessageType::ERROR, format!("root: {:?}", docs_root_path))
+            .await;
+        let tag = parsed.root_element().into();
+        self.client
+            .log_message(MessageType::ERROR, format!("tag: {:?}", tag))
+            .await;
+        let target = get_target_path(&docs_root_path, &tag);
+        self.client
+            .log_message(MessageType::ERROR, format!("target: {:?}", target))
+            .await;
+        self.client
+            .log_message(
+                MessageType::ERROR,
+                format!(
+                    "{:?}",
+                    Uri::from_str(format!("file://{}", target.to_str().unwrap()).as_str()).unwrap()
+                ),
+            )
+            .await;
+        Ok(Some(GotoDefinitionResponse::Link(vec![LocationLink {
+            target_uri: Uri::from_str(target.to_str().unwrap()).unwrap_or(uri.clone()),
+            origin_selection_range: None,
+            target_selection_range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+            target_range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+        }])))
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -120,6 +177,16 @@ impl LanguageServer for Backend {
     }
 }
 
+#[tracing::instrument]
+fn get_docs_root_path(uri: &Uri) -> PathBuf {
+    let uri = uri.as_str();
+    let i = uri
+        .find("sentry-docs")
+        .expect("expected \"sentry-docs\" to be in the full path to the current document");
+    uri[..i + "sentry-docs".len()].into()
+}
+
+#[tracing::instrument]
 fn find_enclosing_tag(contents: &[Vec<u8>], i: usize, j: usize) -> std::result::Result<String, ()> {
     let langle_pos = {
         let mut ii = i as i32;
@@ -137,6 +204,7 @@ fn find_enclosing_tag(contents: &[Vec<u8>], i: usize, j: usize) -> std::result::
             ii -= 1;
         }
         if k != -1 {
+            eprintln!("langle found at {ii}:{k}");
             Some((ii as usize, k as usize))
         } else {
             None
@@ -144,20 +212,17 @@ fn find_enclosing_tag(contents: &[Vec<u8>], i: usize, j: usize) -> std::result::
     };
     let rangle_pos = {
         let mut ii = i;
-        let mut jj = j;
         let mut k = -1_i32;
         while ii < contents.len() {
             let line = &contents[ii];
-            if ii != i {
-                jj = 0;
-            }
-            if let Some(kk) = line.iter().take(jj + 1).position(|c| *c == b'>') {
+            if let Some(kk) = line.iter().position(|c| *c == b'>') {
                 k = kk as i32;
                 break;
             }
             ii += 1;
         }
         if k != -1 {
+            eprintln!("langle found at {ii}:{k}");
             Some((ii, k as usize))
         } else {
             None
@@ -170,25 +235,125 @@ fn find_enclosing_tag(contents: &[Vec<u8>], i: usize, j: usize) -> std::result::
     let (start_i, start_j) = langle_pos.unwrap();
     let (end_i, end_j) = rangle_pos.unwrap();
 
-    Ok(contents[start_i..end_i]
+    Ok(contents[start_i..=end_i]
         .iter()
         .enumerate()
         .map(|(i, line)| {
-            let j = if i == start_i { start_j } else { 0 };
-            let jj = if i == end_i { end_j } else { line.len() - 1 };
-            String::from_utf8_lossy(&contents[i][j..jj]).into_owned()
+            let j = if i + start_i == start_i { start_j } else { 0 };
+            let jj = if i + start_i == end_i {
+                end_j
+            } else {
+                line.len() - 1
+            };
+            String::from_utf8_lossy(&line[j..=jj]).into_owned()
         })
         .collect::<Vec<String>>()
         .join(" "))
 }
 
-#[tokio::main]
-async fn main() {
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
-    let (service, socket) = LspService::new(|client| Backend {
-        client,
-        documents: parking_lot::RwLock::new(HashMap::new()),
-    });
-    Server::new(stdin, stdout, socket).serve(service).await;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_tag_within_tag() {
+        let text: Vec<Vec<u8>> = "<Hello />"
+            .to_owned()
+            .lines()
+            .map(|line| line.to_owned().into_bytes())
+            .collect();
+        let tag = find_enclosing_tag(&text, 0, 0);
+        assert!(tag.is_ok());
+    }
+
+    #[test]
+    fn finds_tag_within_tag_multiple_shorter_lines() {
+        let text: Vec<Vec<u8>> = r#"
+
+<Hello />
+
+"#
+        .to_owned()
+        .lines()
+        .map(|line| line.to_owned().into_bytes())
+        .collect();
+        let tag = find_enclosing_tag(&text, 2, 0);
+        assert!(tag.is_ok());
+    }
+
+    #[test]
+    fn finds_tag_within_tag_spanning_multiple_lines() {
+        let text: Vec<Vec<u8>> = "<Hello \n blabla='hi' \n />"
+            .to_owned()
+            .lines()
+            .map(|line| line.to_owned().into_bytes())
+            .collect();
+        let tag = find_enclosing_tag(&text, 0, 0);
+        assert!(tag.is_ok());
+        assert_eq!(tag.unwrap(), "<Hello   blabla='hi'   />");
+    }
+
+    #[test]
+    fn finds_tag_within_tag_with_attibutes() {
+        let text: Vec<Vec<u8>> = r#"<Hello message="world" a="b" />"#
+            .to_owned()
+            .lines()
+            .map(|line| line.to_owned().into_bytes())
+            .collect();
+        let tag = find_enclosing_tag(&text, 0, 0);
+        assert!(tag.is_ok());
+    }
+
+    #[test]
+    fn does_not_finds_tag_outside_of_tag() {
+        let text: Vec<Vec<u8>> = r#"   <Hello message="world" a="b" />"#
+            .to_owned()
+            .lines()
+            .map(|line| line.to_owned().into_bytes())
+            .collect();
+        let tag = find_enclosing_tag(&text, 0, 0);
+        assert!(tag.is_err());
+    }
+
+    #[test]
+    fn does_not_finds_tag_if_rangle_not_ther() {
+        let text: Vec<Vec<u8>> = r#"<Hello message="world" a="b" "#
+            .to_owned()
+            .lines()
+            .map(|line| line.to_owned().into_bytes())
+            .collect();
+        let tag = find_enclosing_tag(&text, 0, 0);
+        assert!(tag.is_err());
+    }
+}
+
+fn main() {
+    let _guard = sentry::init((
+        "https://6b76fb2a5dc1164849cd797b75b6d879@o447951.ingest.us.sentry.io/4508694563782656",
+        sentry::ClientOptions {
+            traces_sample_rate: 1.0,
+            release: sentry::release_name!(),
+            send_default_pii: true,
+            in_app_exclude: vec!["futures_util", "tower_lsp", "tokio"],
+            ..sentry::ClientOptions::default()
+        },
+    ));
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .with(sentry_tracing::layer())
+        .init();
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let stdin = tokio::io::stdin();
+            let stdout = tokio::io::stdout();
+            let (service, socket) = LspService::new(|client| Backend {
+                client,
+                documents: parking_lot::RwLock::new(HashMap::new()),
+            });
+            Server::new(stdin, stdout, socket).serve(service).await;
+        });
 }
