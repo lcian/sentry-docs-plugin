@@ -6,7 +6,7 @@ use std::str::FromStr;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::lsp_types::*;
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
-use tracing_subscriber::prelude::*;
+use tracing_subscriber::{prelude::*, EnvFilter};
 
 #[derive(Debug)]
 struct Backend {
@@ -29,13 +29,15 @@ impl Backend {
 #[derive(Debug, Clone)]
 enum Tag {
     Include(PathBuf),
+    PlatformContent(PathBuf),
     Other,
 }
 
 impl<'a, 'b> From<Node<'a, 'b>> for Tag {
     fn from(node: Node<'_, '_>) -> Self {
         match node.tag_name().name() {
-            "Include" => Self::Include(node.attribute("name").unwrap().into()),
+            "Include" => Self::Include(node.attribute("name").unwrap_or("").into()),
+            "PlatformContent" => Self::Include(node.attribute("includePath").unwrap_or("").into()),
             _ => Self::Other,
         }
     }
@@ -43,16 +45,15 @@ impl<'a, 'b> From<Node<'a, 'b>> for Tag {
 
 #[tracing::instrument]
 fn get_target_path(root: &PathBuf, tag: &Tag) -> PathBuf {
-    match tag {
-        Tag::Include(path) => {
-            if path.is_absolute() {
-                path.clone()
-            } else {
-                root.join("includes/").join(path)
-            }
-        }
+    let mut res = match tag {
+        Tag::Include(path) => root.join("includes/").join(path),
+        Tag::PlatformContent(path) => root.join("platform-includes/").join(path),
         _ => unimplemented!(),
+    };
+    if res.extension().is_none() {
+        res.set_extension("mdx");
     }
+    res
 }
 
 #[tower_lsp_server::async_trait]
@@ -68,11 +69,12 @@ impl LanguageServer for Backend {
             ),
         });
         let capabilities = ServerCapabilities {
-            position_encoding: Some(PositionEncodingKind::UTF8),
+            position_encoding: Some(PositionEncodingKind::UTF16),
             definition_provider: Some(OneOf::Left(true)),
             text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
             ..Default::default()
         };
+        panic!("test");
         Ok(InitializeResult {
             server_info,
             capabilities,
@@ -135,8 +137,16 @@ impl LanguageServer for Backend {
             return Ok(None);
         }
         let enclosing_tag = enclosing_tag.unwrap();
-        let parsed = Document::parse(enclosing_tag.as_str()).expect("failed to parse tag");
-        let tag_name = parsed.root_element().tag_name();
+        let parsed = Document::parse(enclosing_tag.as_str());
+        if !parsed.is_ok() {
+            self.client
+                .log_message(MessageType::INFO, "goto_definition called with invalid tag")
+                .await;
+            return Ok(None);
+        }
+        let parsed = parsed.unwrap();
+        let root_element = parsed.root_element();
+        let tag_name = root_element.tag_name();
         self.client
             .log_message(
                 MessageType::INFO,
@@ -144,26 +154,8 @@ impl LanguageServer for Backend {
             )
             .await;
         let docs_root_path = get_docs_root_path(&uri);
-        self.client
-            .log_message(MessageType::ERROR, format!("root: {:?}", docs_root_path))
-            .await;
-        let tag = parsed.root_element().into();
-        self.client
-            .log_message(MessageType::ERROR, format!("tag: {:?}", tag))
-            .await;
+        let tag = root_element.into();
         let target = get_target_path(&docs_root_path, &tag);
-        self.client
-            .log_message(MessageType::ERROR, format!("target: {:?}", target))
-            .await;
-        self.client
-            .log_message(
-                MessageType::ERROR,
-                format!(
-                    "{:?}",
-                    Uri::from_str(format!("file://{}", target.to_str().unwrap()).as_str()).unwrap()
-                ),
-            )
-            .await;
         Ok(Some(GotoDefinitionResponse::Link(vec![LocationLink {
             target_uri: Uri::from_str(target.to_str().unwrap()).unwrap_or(uri.clone()),
             origin_selection_range: None,
@@ -197,8 +189,18 @@ fn find_enclosing_tag(contents: &[Vec<u8>], i: usize, j: usize) -> std::result::
             if ii as usize != i {
                 jj = line.len() - 1;
             }
-            if let Some(kk) = line.iter().take(jj + 1).rposition(|c| *c == b'<') {
-                k = kk as i32;
+            let mut brk = false;
+            for kk in (0..=jj).rev() {
+                if line[kk] == b'<' {
+                    k = kk as i32;
+                    brk = true;
+                    break;
+                } else if line[kk] == b'>' && (ii as usize != i || kk != j) {
+                    brk = true;
+                    break;
+                }
+            }
+            if brk {
                 break;
             }
             ii -= 1;
@@ -212,17 +214,31 @@ fn find_enclosing_tag(contents: &[Vec<u8>], i: usize, j: usize) -> std::result::
     };
     let rangle_pos = {
         let mut ii = i;
+        let mut jj = j;
         let mut k = -1_i32;
         while ii < contents.len() {
             let line = &contents[ii];
-            if let Some(kk) = line.iter().position(|c| *c == b'>') {
-                k = kk as i32;
+            let mut brk = false;
+            if ii != i {
+                jj = 0;
+            }
+            for kk in jj..line.len() {
+                if line[kk] == b'>' {
+                    brk = true;
+                    k = kk as i32;
+                    break;
+                } else if line[kk] == b'<' && (ii as usize != i || kk != j) {
+                    brk = true;
+                    break;
+                }
+            }
+            if brk {
                 break;
             }
             ii += 1;
         }
         if k != -1 {
-            eprintln!("langle found at {ii}:{k}");
+            eprintln!("rangle found at {ii}:{k}");
             Some((ii, k as usize))
         } else {
             None
@@ -264,6 +280,19 @@ mod tests {
             .collect();
         let tag = find_enclosing_tag(&text, 0, 0);
         assert!(tag.is_ok());
+        assert_eq!(tag.unwrap(), "<Hello />");
+    }
+
+    #[test]
+    fn finds_tag_within_tag_middle() {
+        let text: Vec<Vec<u8>> = "<Hello />"
+            .to_owned()
+            .lines()
+            .map(|line| line.to_owned().into_bytes())
+            .collect();
+        let tag = find_enclosing_tag(&text, 0, 2);
+        assert!(tag.is_ok());
+        assert_eq!(tag.unwrap(), "<Hello />");
     }
 
     #[test]
@@ -316,7 +345,18 @@ mod tests {
     }
 
     #[test]
-    fn does_not_finds_tag_if_rangle_not_ther() {
+    fn does_not_finds_tag_with_other_tags() {
+        let text: Vec<Vec<u8>> = r#"<A />    <Hello message="world" a="b" />"#
+            .to_owned()
+            .lines()
+            .map(|line| line.to_owned().into_bytes())
+            .collect();
+        let tag = find_enclosing_tag(&text, 0, 6);
+        assert!(tag.is_err());
+    }
+
+    #[test]
+    fn does_not_finds_tag_if_rangle_not_there() {
         let text: Vec<Vec<u8>> = r#"<Hello message="world" a="b" "#
             .to_owned()
             .lines()
@@ -334,11 +374,13 @@ fn main() {
             traces_sample_rate: 1.0,
             release: sentry::release_name!(),
             send_default_pii: true,
-            in_app_exclude: vec!["futures_util", "tower_lsp", "tokio"],
+            in_app_include: vec!["sentry_docs_language_server"],
+            in_app_exclude: vec![""],
             ..sentry::ClientOptions::default()
         },
     ));
     tracing_subscriber::registry()
+        .with(EnvFilter::new("hyper_util::client::legacy::pool=off"))
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .with(sentry_tracing::layer())
         .init();

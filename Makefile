@@ -1,0 +1,2 @@
+.PHONY vscode
+vscode:

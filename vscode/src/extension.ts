@@ -36,8 +36,8 @@ let client: LanguageClient;
 
 export async function activate(context: ExtensionContext) {
 
-    const traceOutputChannel = window.createOutputChannel("Nrs Language Server trace");
-    const command = process.env.SERVER_PATH || "nrs-language-server";
+    const traceOutputChannel = window.createOutputChannel("Sentry Docs Language Server trace");
+    const command = process.env.SERVER_PATH || "sentry-docs-language-server";
     const run: Executable = {
         command,
         options: {
@@ -57,7 +57,7 @@ export async function activate(context: ExtensionContext) {
     // Options to control the language client
     let clientOptions: LanguageClientOptions = {
         // Register the server for plain text documents
-        documentSelector: [{ scheme: "file", language: "nrs" }],
+        documentSelector: [{ scheme: "file", language: "mdx" }],
         synchronize: {
             // Notify the server about file changes to '.clientrc files contained in the workspace
             fileEvents: workspace.createFileSystemWatcher("**/.clientrc"),
@@ -66,7 +66,7 @@ export async function activate(context: ExtensionContext) {
     };
 
     // Create the language client and start the client.
-    client = new LanguageClient("nrs-language-server", "nrs language server", serverOptions, clientOptions);
+    client = new LanguageClient("sentry-docs-language-server", "sentry docs language server", serverOptions, clientOptions);
     // activateInlayHints(context);
     client.start();
 }

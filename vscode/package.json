@@ -2,14 +2,40 @@
   "name": "sentry-docs-plugin",
   "version": "0.1.0",
   "engines": {
-	"vscode": "^1.85.0"
+    "vscode": "^1.85.0"
   },
+  "publisher": "lcian",
   "author": "Lorenzo Cian",
   "license": "MIT",
-  "description": "",
+  "description": "Sentry Docs Language Server Extension",
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:mdx"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [{
+      "id": "mdx",
+      "extensions": [".mdx"]
+    }]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package",
+    "test": "node ./out/test/runTest.js"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^8.1.0"
+  },
   "devDependencies": {
-		"@types/node": "^17.0.18",
-		"vscode-test": "^1.3.0",
-		"@types/vscode": "1.85.0"
-	}
+    "@types/node": "^17.0.18",
+    "vscode-test": "^1.3.0",
+    "@types/vscode": "1.85.0",
+    "@vscode/vsce": "^2.24.0",
+    "typescript": "^5.3.3"
+  }
 }
