@@ -1,0 +1,15 @@
+{
+  "name": "sentry-docs-plugin",
+  "version": "0.1.0",
+  "engines": {
+	"vscode": "^1.85.0"
+  },
+  "author": "Lorenzo Cian",
+  "license": "MIT",
+  "description": "",
+  "devDependencies": {
+		"@types/node": "^17.0.18",
+		"vscode-test": "^1.3.0",
+		"@types/vscode": "1.85.0"
+	}
+}
