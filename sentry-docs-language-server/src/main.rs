@@ -74,7 +74,6 @@ impl LanguageServer for Backend {
             text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
             ..Default::default()
         };
-        panic!("test");
         Ok(InitializeResult {
             server_info,
             capabilities,
